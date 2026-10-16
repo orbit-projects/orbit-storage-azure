@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 from orbit_storage import StorageConfigurationError
 
 _CONTAINER_NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\Z")
+_MAX_TRANSFER_BUFFER_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +37,10 @@ class AzureBlobConfig:
     max_block_size_bytes: int = 4 * 1024 * 1024
     max_concurrent_transfers: int = 4
     max_transfer_concurrency: int = 2
+    retry_total: int = 3
+    retry_initial_backoff_seconds: int = 1
+    retry_increment_base_seconds: int = 2
+    retry_jitter_seconds: int = 3
 
     def __post_init__(self) -> None:
         """Reject credential-bearing URLs and unsafe or unbounded transfer options."""
@@ -77,6 +82,39 @@ class AzureBlobConfig:
         ):
             if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 64:
                 raise StorageConfigurationError(f"{name} must be between 1 and 64.")
+        transfer_buffer_bytes = (
+            self.max_block_size_bytes
+            * self.max_concurrent_transfers
+            * self.max_transfer_concurrency
+        )
+        if transfer_buffer_bytes > _MAX_TRANSFER_BUFFER_BYTES:
+            raise StorageConfigurationError(
+                "max_block_size_bytes multiplied by both transfer concurrency limits "
+                "must not exceed the 64 MiB transfer buffer budget."
+            )
+        if (
+            isinstance(self.retry_total, bool)
+            or not isinstance(self.retry_total, int)
+            or not 0 <= self.retry_total <= 10
+        ):
+            raise StorageConfigurationError("retry_total must be between 0 and 10 retries.")
+        for name, value, maximum in (
+            ("retry_initial_backoff_seconds", self.retry_initial_backoff_seconds, 60),
+            ("retry_increment_base_seconds", self.retry_increment_base_seconds, 10),
+            ("retry_jitter_seconds", self.retry_jitter_seconds, 30),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+                raise StorageConfigurationError(f"{name} must be between 0 and {maximum}.")
+        maximum_backoff = sum(
+            self.retry_initial_backoff_seconds
+            + self.retry_increment_base_seconds**attempt
+            + self.retry_jitter_seconds
+            for attempt in range(self.retry_total)
+        )
+        if maximum_backoff > 180:
+            raise StorageConfigurationError(
+                "configured Azure retry backoff must not exceed 180 seconds total."
+            )
 
     def _validate_account_url(self) -> None:
         """Require HTTPS unless explicitly using a local HTTP emulator endpoint."""

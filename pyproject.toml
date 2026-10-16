@@ -13,17 +13,18 @@ license-files = ["LICENSE"]
 dependencies = [
   "azure-identity>=1.26,<2",
   "azure-storage-blob[aio]>=12.31,<13",
-  "orbit-core>=0.1.0a1,<0.2",
   "orbit-storage>=0.1.0a1,<0.2",
 ]
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
   "Typing :: Typed",
 ]
 
 [project.optional-dependencies]
+core = ["orbit-core>=0.1.0a1,<0.2"]
 dev = [
+  "orbit-core>=0.1.0a1,<0.2",
   "pytest>=8,<10",
   "pytest-asyncio>=0.24,<2",
   "ruff>=0.8,<1",

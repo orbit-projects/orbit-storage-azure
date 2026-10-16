@@ -15,8 +15,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import tomllib
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -29,7 +32,18 @@ from orbit_storage import (
     StorageOperationError,
 )
 
-from orbit_storage_azure import AzureBlobConfig, AzureBlobObjectStore, AzureBlobStorePlugin
+from orbit_storage_azure import AzureBlobConfig, AzureBlobObjectStore
+from orbit_storage_azure import store as store_module
+from orbit_storage_azure.plugin import AzureBlobStorePlugin
+
+
+def test_core_lifecycle_dependency_is_optional() -> None:
+    """The object store can be used without Core unless its plugin extra is installed."""
+    manifest = tomllib.loads(
+        (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
+    assert not any(dep.startswith("orbit-core") for dep in manifest["dependencies"])
+    assert manifest["optional-dependencies"]["core"] == ["orbit-core>=0.1.0a1,<0.2"]
 
 
 class FakeResponseError(Exception):
@@ -224,6 +238,83 @@ def test_config_rejects_credentials_in_endpoint_and_invalid_container() -> None:
     assert AzureBlobConfig(
         account_url="http://127.0.0.1:10000", container="valid", allow_insecure_http=True
     ).allow_insecure_http
+    bounded = AzureBlobConfig(
+        account_url="https://storage.example.test",
+        container="bounded",
+        max_block_size_bytes=8 * 1024 * 1024,
+        max_concurrent_transfers=4,
+        max_transfer_concurrency=2,
+    )
+    assert (
+        bounded.max_block_size_bytes
+        * bounded.max_concurrent_transfers
+        * bounded.max_transfer_concurrency
+        == 64 * 1024 * 1024
+    )
+    with pytest.raises(StorageConfigurationError, match="64 MiB transfer buffer budget"):
+        AzureBlobConfig(
+            account_url="https://storage.example.test",
+            container="too-large",
+            max_block_size_bytes=4 * 1024 * 1024,
+            max_concurrent_transfers=4,
+            max_transfer_concurrency=5,
+        )
+    with pytest.raises(StorageConfigurationError, match="retry_total"):
+        AzureBlobConfig(
+            account_url="https://storage.example.test", container="valid", retry_total=11
+        )
+    with pytest.raises(StorageConfigurationError, match="180 seconds"):
+        AzureBlobConfig(
+            account_url="https://storage.example.test",
+            container="valid",
+            retry_total=10,
+            retry_initial_backoff_seconds=60,
+            retry_increment_base_seconds=10,
+            retry_jitter_seconds=30,
+        )
+
+
+@pytest.mark.asyncio
+async def test_service_client_uses_bounded_exponential_retry_with_jitter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Azure service client receives explicit retry and jitter settings."""
+    container = FakeContainer()
+    credential = FakeCredential()
+    service = FakeService(container)
+    observed: dict[str, object] = {}
+    options: dict[str, int] = {}
+
+    class RetryPolicy:
+        def __init__(self, **kwargs: int) -> None:
+            options.update(kwargs)
+
+    def create_service(*_args: object, **kwargs: object) -> FakeService:
+        observed.update(kwargs)
+        return service
+
+    monkeypatch.setattr(store_module, "ExponentialRetry", RetryPolicy)
+    store = AzureBlobObjectStore(
+        AzureBlobConfig(
+            account_url="https://storage.example.test",
+            container="orbit-test",
+            retry_total=2,
+            retry_initial_backoff_seconds=2,
+            retry_increment_base_seconds=3,
+            retry_jitter_seconds=4,
+        ),
+        credential_factory=lambda: credential,
+        service_client_factory=create_service,
+    )
+    await store._get_container()
+    assert options == {
+        "initial_backoff": 2,
+        "increment_base": 3,
+        "retry_total": 2,
+        "random_jitter_range": 4,
+    }
+    assert observed["retry_policy"] is not None
+    await store.aclose()
 
 
 @pytest.mark.asyncio
@@ -248,6 +339,82 @@ async def test_put_get_stream_and_delete_follow_storage_contract() -> None:
     assert await store.get("missing") is None
     await store.aclose()
     assert service.closed and credential.closed
+
+
+@pytest.mark.asyncio
+async def test_open_download_holds_a_bounded_transfer_slot_until_stream_close() -> None:
+    container = FakeContainer()
+    store, _, _ = make_store(container, max_concurrent_transfers=1)
+    await store.put("one", b"one")
+    await store.put("two", b"two")
+
+    first = await store.get("one")
+    assert first is not None
+    second_task = asyncio.create_task(store.get("two"))
+    await asyncio.sleep(0)
+    assert not second_task.done()
+
+    await first.aclose()
+    second = await asyncio.wait_for(second_task, timeout=1)
+    assert second is not None
+    await second.aclose()
+    await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_service_close_retries_without_reclosing_credential() -> None:
+    store, credential, service = make_store(FakeContainer())
+    await store._get_container()
+    service_attempts = 0
+
+    async def fail_once() -> None:
+        nonlocal service_attempts
+        service_attempts += 1
+        if service_attempts == 1:
+            raise RuntimeError("temporary service close failure")
+        service.closed = True
+
+    service.close = fail_once
+    with pytest.raises(StorageOperationError, match="shutdown failed"):
+        await store.aclose()
+
+    assert credential.closed
+    assert not service.closed
+    with pytest.raises(StorageOperationError, match="closed"):
+        await store.get("after-close")
+
+    await store.aclose()
+
+    assert service_attempts == 2
+    assert service.closed
+    assert credential.closed
+
+
+@pytest.mark.asyncio
+async def test_failed_credential_close_does_not_reclose_service() -> None:
+    store, credential, service = make_store(FakeContainer())
+    await store._get_container()
+    credential_attempts = 0
+
+    async def fail_once() -> None:
+        nonlocal credential_attempts
+        credential_attempts += 1
+        if credential_attempts == 1:
+            raise RuntimeError("temporary credential close failure")
+        credential.closed = True
+
+    credential.close = fail_once
+    with pytest.raises(StorageOperationError, match="shutdown failed"):
+        await store.aclose()
+
+    assert service.closed
+    assert not credential.closed
+
+    await store.aclose()
+
+    assert credential_attempts == 2
+    assert service.closed
+    assert credential.closed
 
 
 @pytest.mark.asyncio
@@ -302,6 +469,8 @@ async def test_plugin_closes_service_and_credential_resources() -> None:
     app = Application(ApplicationConfig(name="azure-plugin-test"))
     app.plugins.register(AzureBlobStorePlugin(store))
     await app.startup()
+    result = await app.plugins.plugins[0].control_actions[0].handler({})
+    assert result is not None and result.summary == "Azure container listing is available."
     await store.put("registered", b"value")
     assert await app.container.aresolve(OBJECT_STORE_DEPENDENCY_KEY) is store
     await app.stop()

@@ -19,3 +19,8 @@ Optional SDKs and live-service tests are described by the package README. Do not
 ## Contribution expectations
 
 Add focused regression coverage for behavior changes. Update the README and relevant guide when a contract, configuration option, security property, lifecycle rule, or operational assumption changes. Report the exact versions and services exercised; local checks do not imply hosted CI or release validation.
+
+The current local quality matrix passes on CPython 3.11, 3.12, 3.13, and 3.14: all 9 tests, Ruff
+lint and format checks, strict mypy, and wheel/sdist builds pass on each interpreter. Tests use
+injected clients and credentials; they do not verify Azure role assignments, network behavior,
+storage account configuration, or hosted CI.

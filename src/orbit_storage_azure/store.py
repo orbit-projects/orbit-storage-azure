@@ -25,7 +25,7 @@ from azure.core import MatchConditions
 from azure.core.credentials_async import AsyncTokenCredential
 from azure.identity.aio import DefaultAzureCredential
 from azure.storage.blob import ContentSettings
-from azure.storage.blob.aio import BlobServiceClient
+from azure.storage.blob.aio import BlobServiceClient, ExponentialRetry
 from orbit_storage import (
     ListObjectsRequest,
     ObjectInfo,
@@ -125,9 +125,10 @@ class _CountingBody:
 class _AzureBodyReader:
     """Adapt Azure's async chunk iterator to Orbit's explicitly closeable body reader."""
 
-    def __init__(self, downloader: _Downloader) -> None:
+    def __init__(self, downloader: _Downloader, release_transfer_slot: Callable[[], None]) -> None:
         """Take ownership of the SDK's lazy chunk iterator."""
         self._iterator = downloader.chunks().__aiter__()
+        self._release_transfer_slot = release_transfer_slot
         self._closed = False
 
     def __aiter__(self) -> _AzureBodyReader:
@@ -156,15 +157,17 @@ class _AzureBodyReader:
     async def aclose(self) -> None:
         """Close the SDK iterator when supported; the service client remains store-owned."""
         if not self._closed:
-            close = getattr(self._iterator, "aclose", None)
-            if close is not None:
-                try:
-                    await close()
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    raise StorageOperationError("Azure download stream close failed.") from None
             self._closed = True
+            try:
+                close = getattr(self._iterator, "aclose", None)
+                if close is not None:
+                    await close()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                raise StorageOperationError("Azure download stream close failed.") from None
+            finally:
+                self._release_transfer_slot()
 
 
 class AzureBlobObjectStore(ObjectStore):
@@ -194,6 +197,9 @@ class AzureBlobObjectStore(ObjectStore):
         self._client_lock = asyncio.Lock()
         self._transfer_slots = asyncio.Semaphore(config.max_concurrent_transfers)
         self._closed = False
+        self._service_closed = False
+        self._credential_closed = False
+        self._close_complete = False
 
     async def _get_container(self) -> _Container:
         """Create one credential and service client lazily, then retain their container handle."""
@@ -211,6 +217,12 @@ class AzureBlobObjectStore(ObjectStore):
                         max_block_size=self.config.max_block_size_bytes,
                         max_single_get_size=self.config.max_block_size_bytes,
                         max_chunk_get_size=self.config.max_block_size_bytes,
+                        retry_policy=ExponentialRetry(
+                            initial_backoff=self.config.retry_initial_backoff_seconds,
+                            increment_base=self.config.retry_increment_base_seconds,
+                            retry_total=self.config.retry_total,
+                            random_jitter_range=self.config.retry_jitter_seconds,
+                        ),
                     )
                     container = service.get_container_client(self.config.container)
                 except asyncio.CancelledError:
@@ -348,36 +360,44 @@ class AzureBlobObjectStore(ObjectStore):
     async def get(self, key: str) -> StoredObject | None:
         """Fetch metadata, then open an ETag-pinned chunk stream for that exact version."""
         blob_name = self._key(key)
-        container = await self._get_container()
-        blob = container.get_blob_client(blob_name)
+        await self._transfer_slots.acquire()
+        release_slot = True
         try:
-            properties = await blob.get_blob_properties(
-                timeout=math.ceil(self.config.request_timeout_seconds)
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            if self._not_found(error):
-                return None
-            raise StorageOperationError("Azure blob metadata request failed.") from None
-        info = self._info(blob_name, properties)
-        etag = self._value(properties, "etag")
-        if not isinstance(etag, str) or not etag:
-            raise StorageOperationError("Azure returned invalid blob ETag metadata.")
-        try:
-            downloader = await blob.download_blob(
-                etag=etag,
-                match_condition=MatchConditions.IfNotModified,
-                max_concurrency=self.config.max_transfer_concurrency,
-                timeout=math.ceil(self.config.request_timeout_seconds),
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            if self._not_found(error):
-                return None
-            raise StorageOperationError("Azure blob download could not be opened.") from None
-        return StoredObject(info=info, body=_AzureBodyReader(downloader))
+            container = await self._get_container()
+            blob = container.get_blob_client(blob_name)
+            try:
+                properties = await blob.get_blob_properties(
+                    timeout=math.ceil(self.config.request_timeout_seconds)
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if self._not_found(error):
+                    return None
+                raise StorageOperationError("Azure blob metadata request failed.") from None
+            info = self._info(blob_name, properties)
+            etag = self._value(properties, "etag")
+            if not isinstance(etag, str) or not etag:
+                raise StorageOperationError("Azure returned invalid blob ETag metadata.")
+            try:
+                downloader = await blob.download_blob(
+                    etag=etag,
+                    match_condition=MatchConditions.IfNotModified,
+                    max_concurrency=self.config.max_transfer_concurrency,
+                    timeout=math.ceil(self.config.request_timeout_seconds),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if self._not_found(error):
+                    return None
+                raise StorageOperationError("Azure blob download could not be opened.") from None
+            body = _AzureBodyReader(downloader, self._transfer_slots.release)
+            release_slot = False
+            return StoredObject(info=info, body=body)
+        finally:
+            if release_slot:
+                self._transfer_slots.release()
 
     async def delete(self, key: str) -> bool:
         """Delete an object, returning false only if the preceding existence check missed."""
@@ -446,23 +466,35 @@ class AzureBlobObjectStore(ObjectStore):
             ) from None
 
     async def aclose(self) -> None:
-        """Close the owned service client and Azure credential exactly once."""
+        """Reject new work and retry only Azure resources whose close has not succeeded."""
         async with self._client_lock:
-            if self._closed:
+            if self._close_complete:
                 return
             self._closed = True
-            try:
+            failure = False
+            if self._service is None:
+                self._service_closed = True
+            elif not self._service_closed:
                 try:
-                    if self._service is not None:
-                        await self._service.close()
-                finally:
-                    if self._credential is not None:
-                        await self._credential.close()
-            except asyncio.CancelledError:
-                self._closed = False
-                raise
-            except Exception:
+                    await self._service.close()
+                    self._service_closed = True
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    failure = True
+            if self._credential is None:
+                self._credential_closed = True
+            elif not self._credential_closed:
+                try:
+                    await self._credential.close()
+                    self._credential_closed = True
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    failure = True
+            if failure:
                 raise StorageOperationError("Azure storage client shutdown failed.") from None
+            self._close_complete = True
 
 
 __all__ = ["AzureBlobObjectStore"]

@@ -13,8 +13,10 @@
 # limitations under the License.
 """Optional Core plugin that registers and owns the Azure object-store adapter."""
 
+from collections.abc import Mapping
+
 from orbit import Application
-from orbit.plugins import Plugin, PluginMetadata
+from orbit.plugins import ControlAction, ControlResult, Plugin, PluginMetadata
 from orbit_storage import OBJECT_STORE_DEPENDENCY_KEY
 
 from orbit_storage_azure.store import AzureBlobObjectStore
@@ -34,6 +36,14 @@ class AzureBlobStorePlugin(Plugin):
         if not isinstance(store, AzureBlobObjectStore):
             raise TypeError("AzureBlobStorePlugin requires an AzureBlobObjectStore instance.")
         self.store = store
+        self.control_actions = (
+            ControlAction(
+                id="check-connection",
+                title="Check Azure container access",
+                description="List at most one blob to verify access to the configured container.",
+                handler=self._check_connection,
+            ),
+        )
 
     def setup(self, application: Application) -> None:
         """Expose the provider through Orbit Storage's stable dependency key."""
@@ -44,6 +54,11 @@ class AzureBlobStorePlugin(Plugin):
     async def deactivate(self) -> None:
         """Close the Azure SDK client and identity credential during shutdown."""
         await self.store.aclose()
+
+    async def _check_connection(self, _: Mapping[str, object]) -> ControlResult:
+        """Issue one bounded read-only list request without displaying blob names."""
+        await self.store.list_page(limit=1)
+        return ControlResult("Azure container listing is available.")
 
 
 __all__ = ["AzureBlobStorePlugin"]

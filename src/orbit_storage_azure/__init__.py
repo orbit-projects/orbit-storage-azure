@@ -14,7 +14,6 @@
 """Optional Azure Blob Storage adapter for Orbit's object storage capability."""
 
 from orbit_storage_azure.config import AzureBlobConfig
-from orbit_storage_azure.plugin import AzureBlobStorePlugin
 from orbit_storage_azure.store import AzureBlobObjectStore
 
-__all__ = ["AzureBlobConfig", "AzureBlobObjectStore", "AzureBlobStorePlugin"]
+__all__ = ["AzureBlobConfig", "AzureBlobObjectStore"]
